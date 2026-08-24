@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AUDIBLE_FREQ_0, AUDIBLE_FREQ_1, ULTRASONIC_FREQ_0, ULTRASONIC_FREQ_1 } from "./constants";
-import { compareBits, recoverFrame } from "./demod";
+import { compareBits, describeCompare, recoverFrame } from "./demod";
 import { scanHops, synthesizeFsk } from "./dsp";
 import { encodeMessage, type Bit } from "./protocol";
 
@@ -84,5 +84,7 @@ describe("shared hop demodulator", () => {
     const compared = compareBits(got, expected);
     expect(compared.offset).toBe(2);
     expect(compared.matches).toBe(8);
+    expect(describeCompare(got, expected)).toMatch(/line up/);
+    expect(describeCompare([], expected)).toMatch(/empty until the mic hears a real FSK tone/);
   });
 });

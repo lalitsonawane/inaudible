@@ -1,8 +1,11 @@
-import { TARGET_SAMPLE_RATE, frequenciesFor, type Band } from "./constants";
+import { HOP_SAMPLES, TARGET_SAMPLE_RATE, frequenciesFor, type Band } from "./constants";
+import { BurstCollector } from "./burst";
 import { attachPcmTap } from "./capture";
 import { recoverFrame } from "./demod";
 import { HopScanner, hopPowerDb, type SoftHop } from "./dsp";
-import { findSyncIndex, type Bit, type DecodeResult } from "./protocol";
+import type { Bit, DecodeResult } from "./protocol";
+
+export type ListenPhase = "quiet" | "collecting" | "decoded";
 
 export interface SpectrumSample {
   freq0: number;
@@ -12,6 +15,8 @@ export interface SpectrumSample {
   decision: Bit | null;
   sampleRate: number;
   hops: number;
+  phase: ListenPhase;
+  phaseText: string;
 }
 
 export interface ReceiverHandlers {
@@ -27,8 +32,8 @@ interface ActiveSession {
   source: MediaStreamAudioSourceNode;
   disposeTap: () => void;
   scanner: HopScanner;
-  hops: SoftHop[];
-  lastCrcBits: number;
+  burst: BurstCollector;
+  hopsSincePreview: number;
 }
 
 function microphoneConstraints(): MediaTrackConstraints {
@@ -40,6 +45,10 @@ function microphoneConstraints(): MediaTrackConstraints {
     sampleRate: { ideal: TARGET_SAMPLE_RATE },
     voiceIsolation: false,
   } as MediaTrackConstraints;
+}
+
+function displayLevel(power: number, noisePeak: number): number {
+  return Math.min(0, hopPowerDb(power) - hopPowerDb(Math.max(noisePeak, 1e-12)) - 8);
 }
 
 export class FskReceiver {
@@ -84,15 +93,13 @@ export class FskReceiver {
     }
 
     const source = this.context.createMediaStreamSource(stream);
-    const scanner = new HopScanner();
-    const hops: SoftHop[] = [];
     const session: ActiveSession = {
       stream,
       source,
       disposeTap: () => undefined,
-      scanner,
-      hops,
-      lastCrcBits: -1,
+      scanner: new HopScanner(),
+      burst: new BurstCollector(),
+      hopsSincePreview: 0,
     };
 
     session.disposeTap = await attachPcmTap(this.context, source, (chunk) => {
@@ -108,8 +115,11 @@ export class FskReceiver {
         `Listening at ${Math.round(rate)} Hz — too low for ultrasonic. Switch to the audible band.`,
       );
     } else {
-      this.handlers.onStatus?.(`Listening with Goertzel hops at ${Math.round(this.context.sampleRate)} Hz`);
+      this.handlers.onStatus?.(
+        `Listening at ${Math.round(this.context.sampleRate)} Hz. Waiting for an FSK tone — mixed bits will stay empty until then.`,
+      );
     }
+    this.handlers.onBits?.([]);
   }
 
   stop(): void {
@@ -123,13 +133,11 @@ export class FskReceiver {
   }
 
   resetBits(): void {
-    if (!this.session) {
-      this.handlers.onBits?.([]);
-      return;
+    if (this.session) {
+      this.session.scanner.reset();
+      this.session.burst.reset();
+      this.session.hopsSincePreview = 0;
     }
-    this.session.scanner.reset();
-    this.session.hops = [];
-    this.session.lastCrcBits = -1;
     this.handlers.onBits?.([]);
   }
 
@@ -138,47 +146,83 @@ export class FskReceiver {
     const next = session.scanner.push(chunk, freq0, freq1, this.context.sampleRate);
     if (next.length === 0) return;
 
-    session.hops.push(...next);
-    if (session.hops.length > 2000) {
-      session.hops.splice(0, session.hops.length - 2000);
+    let lastReading = { tone: false, decision: null as Bit | null, peak: 0, snr: 0 };
+    let lastHop = next[next.length - 1];
+    let flushed: SoftHop[] | null = null;
+
+    for (const hop of next) {
+      lastHop = hop;
+      const result = session.burst.push(hop);
+      lastReading = result.reading;
+      if (result.event === "collecting") {
+        session.hopsSincePreview += 1;
+        if (session.hopsSincePreview >= 12 && session.burst.hops.length >= 40) {
+          session.hopsSincePreview = 0;
+          this.preview(session.burst.hops);
+        }
+      }
+      if (result.event === "flush") {
+        flushed = session.burst.takeBurst();
+      }
     }
 
-    const hop = next[next.length - 1];
-    const total = hop.p0 + hop.p1 + 1e-15;
+    const phase: ListenPhase = flushed ? "quiet" : session.burst.hops.length > 0 ? "collecting" : "quiet";
+    const seconds = (session.burst.hops.length * HOP_SAMPLES) / this.context.sampleRate;
+    const phaseText =
+      phase === "collecting"
+        ? `Hearing an FSK tone (${seconds.toFixed(1)} s). Not a decoded message yet.`
+        : "Listening. No FSK tone — the mic is not hearing a clear 0/1 carrier.";
+
     this.handlers.onSpectrum?.({
       freq0,
       freq1,
-      energy0: hopPowerDb(hop.p0 / total),
-      energy1: hopPowerDb(hop.p1 / total),
-      decision: hop.p1 === hop.p0 ? null : hop.p1 > hop.p0 ? 1 : 0,
+      energy0: displayLevel(lastHop.p0, session.burst.noisePeak),
+      energy1: displayLevel(lastHop.p1, session.burst.noisePeak),
+      decision: lastReading.decision,
       sampleRate: this.context.sampleRate,
-      hops: session.hops.length,
+      hops: session.burst.hops.length,
+      phase,
+      phaseText,
     });
 
-    const recovered = recoverFrame(session.hops);
-    this.handlers.onBits?.([...recovered.bits]);
+    if (flushed) {
+      this.finishBurst(flushed);
+    }
+  }
 
+  private preview(hops: SoftHop[]): void {
+    const recovered = recoverFrame(hops);
+    if (recovered.bits.length === 0) return;
+    this.handlers.onBits?.([...recovered.bits]);
     if (recovered.decoded.ok) {
       this.handlers.onDecode?.(recovered.decoded);
-      this.handlers.onStatus?.(
-        `Decoded a frame (phase ${recovered.phase}, ${recovered.hopsPerBit} hops/bit)`,
-      );
-      session.scanner.reset();
-      session.hops = [];
-      session.lastCrcBits = -1;
+      this.handlers.onStatus?.(`Decoded a frame while the tone was still playing`);
+      this.resetBits();
+    }
+  }
+
+  private finishBurst(hops: SoftHop[]): void {
+    if (hops.length < 20) {
+      this.handlers.onBits?.([]);
+      this.handlers.onStatus?.("Tone ended too quickly to be a message. Still listening.");
       return;
     }
-
-    if (
-      recovered.decoded.reason.startsWith("CRC mismatch") &&
-      recovered.bits.length !== session.lastCrcBits
-    ) {
-      session.lastCrcBits = recovered.bits.length;
+    const recovered = recoverFrame(hops);
+    this.handlers.onBits?.([...recovered.bits]);
+    if (recovered.decoded.ok) {
       this.handlers.onDecode?.(recovered.decoded);
-      const syncIndex = findSyncIndex(recovered.bits);
-      if (syncIndex >= 0 && session.hops.length > 40) {
-        session.hops = session.hops.slice(Math.floor(session.hops.length / 3));
-      }
+      this.handlers.onStatus?.(`Decoded a frame (${recovered.hopsPerBit.toFixed(1)} hops/bit)`);
+      return;
     }
+    if (recovered.decoded.reason.startsWith("CRC mismatch")) {
+      this.handlers.onDecode?.(recovered.decoded);
+      this.handlers.onStatus?.(
+        "Heard a frame-like burst but the bits were damaged. Try closer, louder, or the audible band.",
+      );
+      return;
+    }
+    this.handlers.onStatus?.(
+      "Heard a tone burst that did not turn into a message. Those Live bits are a guess, not a decode.",
+    );
   }
 }

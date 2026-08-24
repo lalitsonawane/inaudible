@@ -1,5 +1,5 @@
 import { BANDS, MAX_PAYLOAD_BYTES, TARGET_SAMPLE_RATE, type Band } from "../audio/constants";
-import { compareBits, recoverFrame } from "../audio/demod";
+import { describeCompare, recoverFrame } from "../audio/demod";
 import { scanHops, synthesizeFsk } from "../audio/dsp";
 import { FskReceiver, type SpectrumSample } from "../audio/receiver";
 import { transmitBits } from "../audio/sender";
@@ -71,18 +71,17 @@ export function mountApp(root: HTMLElement): void {
   const clearButton = el("button", "secondary", "Clear bits");
   const selfTestButton = el("button", "secondary", "Self-test decoder");
 
-  function showBits(bits: Bit[], label = "Bits"): void {
-    bitsView.textContent = bits.length ? `${label} (${bits.length}): ${formatBitString(bits)}` : "Bits: —";
-    const compared = compareBits(bits, lastExpected);
-    compareView.textContent = bits.length
-      ? `vs expected: ${compared.matches}/${compared.compared} match at offset ${compared.offset}`
-      : "vs expected: —";
+  function showBits(bits: Bit[], label = "Guessed bits"): void {
+    bitsView.textContent = bits.length
+      ? `${label} (${bits.length}): ${formatBitString(bits)}`
+      : "Guessed bits: none yet";
+    compareView.textContent = describeCompare(bits, lastExpected);
   }
 
   const receiver = new FskReceiver(audioContext, {
     onStatus: (text) => setStatus(text),
     onError: (error) => setStatus(error.message, true),
-    onBits: (bits) => showBits(bits, "Live"),
+    onBits: (bits) => showBits(bits, "Guessed bits"),
     onDecode: (result: DecodeResult) => {
       if (result.ok) {
         message.textContent = result.text;
@@ -94,8 +93,8 @@ export function mountApp(root: HTMLElement): void {
     onSpectrum: (sample: SpectrumSample) => {
       bar0.style.width = energyWidth(sample.energy0);
       bar1.style.width = energyWidth(sample.energy1);
-      const decided = sample.decision === null ? "silence" : `bit ${sample.decision}`;
-      spectrumMeta.textContent = `${sample.freq0} Hz ${sample.energy0.toFixed(1)} dB · ${sample.freq1} Hz ${sample.energy1.toFixed(1)} dB · ${decided} · ${sample.sampleRate} Hz · ${sample.hops} hops`;
+      const decided = sample.decision === null ? "no clear bit" : `hearing bit ${sample.decision}`;
+      spectrumMeta.textContent = `${sample.phaseText} · ${decided} · ${sample.sampleRate} Hz`;
     },
   });
 
@@ -120,7 +119,7 @@ export function mountApp(root: HTMLElement): void {
     const rate = audioContext.sampleRate || TARGET_SAMPLE_RATE;
     const audio = synthesizeFsk(bits, freq0, freq1, rate);
     const recovered = recoverFrame(scanHops(audio, freq0, freq1, rate));
-    showBits(recovered.bits, "Self-test");
+    showBits(recovered.bits, "Self-test bits");
     if (recovered.decoded.ok) {
       message.textContent = recovered.decoded.text;
       setStatus(
@@ -194,7 +193,7 @@ export function mountApp(root: HTMLElement): void {
     el(
       "p",
       "lede",
-      "Sender and receiver now share the same Goertzel hop decoder. Start listening first, then transmit. Self-test uses the identical demodulator on clean PCM so you can compare bit strings.",
+      "Start listening on the receiver, then transmit. Self-test proves the decoder on clean audio. Live bits only appear when the microphone hears a real FSK tone — a churning wall of 0s and 1s was just noise.",
     ),
   );
 
@@ -221,7 +220,7 @@ export function mountApp(root: HTMLElement): void {
   receiveRow.append(listenButton, clearButton, selfTestButton);
   receivePanel.append(
     el("h2", undefined, "Receiver"),
-    el("p", "hint", "Live decode reads microphone PCM and searches every symbol phase. If vs expected stays low, the mic is not hearing both carriers — try the audible band or raise volume."),
+    el("p", "hint", "The two bars are the 0 and 1 carriers. Guessed bits are not the message until the green line shows decoded text. A ~50–70% match means random noise, not a lock."),
     receiveRow,
     spectrum,
     spectrumMeta,

@@ -119,6 +119,24 @@ export function recoverFrame(hops: readonly SoftHop[]): FrameRecovery {
   return search(0) ?? search(1) ?? best;
 }
 
+export function describeCompare(got: readonly Bit[], expected: readonly Bit[]): string {
+  if (got.length === 0) {
+    return "No message bits yet. Live bits stay empty until the mic hears a real FSK tone, not room noise.";
+  }
+  const compared = compareBits(got, expected);
+  if (compared.compared === 0) {
+    return "No message bits yet.";
+  }
+  const percent = Math.round((compared.matches / compared.compared) * 100);
+  if (percent < 70) {
+    return `${compared.matches}/${compared.compared} match (${percent}%). That is close to random — not a decoded message.`;
+  }
+  if (percent < 95) {
+    return `${compared.matches}/${compared.compared} match (${percent}%). Partial lock; still waiting for a clean frame.`;
+  }
+  return `${compared.matches}/${compared.compared} match (${percent}%). Bits line up with the typed message.`;
+}
+
 export function compareBits(got: readonly Bit[], expected: readonly Bit[]): BitCompare {
   let best: BitCompare = { offset: 0, matches: 0, compared: 0 };
   if (got.length === 0 || expected.length === 0) return best;
