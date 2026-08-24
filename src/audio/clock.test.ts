@@ -33,6 +33,16 @@ describe("BitSlicer clock recovery", () => {
     }
   });
 
+  it("does not invent extra bits after a dropout", () => {
+    const slicer = new BitSlicer();
+    slicer.push(0, 1);
+    slicer.push(50, 1);
+    slicer.push(80, null);
+    slicer.push(200, 1);
+    slicer.push(250, 1);
+    expect(slicer.bits.length).toBeLessThanOrEqual(3);
+  });
+
   it("the old 0.85-interval sampler drifts and fails to decode", () => {
     const framed = encodeMessage("hello fsk");
     const naive = sampleFixedInterval(decisionsFromBits(framed, { smearMs: 0, detectDelayMs: 8 }));

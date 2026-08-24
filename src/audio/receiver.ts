@@ -1,15 +1,8 @@
-import {
-  ANALYSER_SMOOTHING,
-  FFT_SIZE,
-  PEAK_NEIGHBOR_BINS,
-  SYNC_BITS,
-  TARGET_SAMPLE_RATE,
-  frequenciesFor,
-  type Band,
-} from "./constants";
-import { bandEnergy, binForFrequency, decideBit } from "./classify";
-import { BitSlicer } from "./clock";
-import { decodeFramedBits, findSyncIndex, type Bit, type DecodeResult } from "./protocol";
+import { TARGET_SAMPLE_RATE, frequenciesFor, type Band } from "./constants";
+import { attachPcmTap } from "./capture";
+import { recoverFrame } from "./demod";
+import { HopScanner, hopPowerDb, type SoftHop } from "./dsp";
+import { findSyncIndex, type Bit, type DecodeResult } from "./protocol";
 
 export interface SpectrumSample {
   freq0: number;
@@ -17,6 +10,8 @@ export interface SpectrumSample {
   energy0: number;
   energy1: number;
   decision: Bit | null;
+  sampleRate: number;
+  hops: number;
 }
 
 export interface ReceiverHandlers {
@@ -30,9 +25,10 @@ export interface ReceiverHandlers {
 interface ActiveSession {
   stream: MediaStream;
   source: MediaStreamAudioSourceNode;
-  analyser: AnalyserNode;
-  raf: number;
-  slicer: BitSlicer;
+  disposeTap: () => void;
+  scanner: HopScanner;
+  hops: SoftHop[];
+  lastCrcBits: number;
 }
 
 function microphoneConstraints(): MediaTrackConstraints {
@@ -41,8 +37,9 @@ function microphoneConstraints(): MediaTrackConstraints {
     noiseSuppression: false,
     autoGainControl: false,
     channelCount: 1,
-    sampleRate: TARGET_SAMPLE_RATE,
-  };
+    sampleRate: { ideal: TARGET_SAMPLE_RATE },
+    voiceIsolation: false,
+  } as MediaTrackConstraints;
 }
 
 export class FskReceiver {
@@ -55,10 +52,13 @@ export class FskReceiver {
     return this.session !== null;
   }
 
+  get sampleRate(): number {
+    return this.context.sampleRate;
+  }
+
   setBand(band: Band): void {
     this.band = band;
-    this.session?.slicer.reset();
-    this.handlers.onBits?.([]);
+    this.resetBits();
   }
 
   async start(): Promise<void> {
@@ -84,35 +84,38 @@ export class FskReceiver {
     }
 
     const source = this.context.createMediaStreamSource(stream);
-    const analyser = this.context.createAnalyser();
-    analyser.fftSize = FFT_SIZE;
-    analyser.smoothingTimeConstant = ANALYSER_SMOOTHING;
-    analyser.minDecibels = -100;
-    analyser.maxDecibels = -20;
-    source.connect(analyser);
-
+    const scanner = new HopScanner();
+    const hops: SoftHop[] = [];
     const session: ActiveSession = {
       stream,
       source,
-      analyser,
-      raf: 0,
-      slicer: new BitSlicer(),
+      disposeTap: () => undefined,
+      scanner,
+      hops,
+      lastCrcBits: -1,
     };
-    this.session = session;
-    this.handlers.onStatus?.("Listening for FSK tones");
 
-    const loop = (): void => {
+    session.disposeTap = await attachPcmTap(this.context, source, (chunk) => {
       if (this.session !== session) return;
-      this.tick(session);
-      session.raf = requestAnimationFrame(loop);
-    };
-    session.raf = requestAnimationFrame(loop);
+      this.ingest(session, chunk);
+    });
+
+    this.session = session;
+    const trackRate = stream.getAudioTracks()[0]?.getSettings().sampleRate;
+    const rate = trackRate || this.context.sampleRate;
+    if (rate < 40_000 && this.band === "ultrasonic") {
+      this.handlers.onStatus?.(
+        `Listening at ${Math.round(rate)} Hz — too low for ultrasonic. Switch to the audible band.`,
+      );
+    } else {
+      this.handlers.onStatus?.(`Listening with Goertzel hops at ${Math.round(this.context.sampleRate)} Hz`);
+    }
   }
 
   stop(): void {
     const session = this.session;
     if (!session) return;
-    cancelAnimationFrame(session.raf);
+    session.disposeTap();
     session.source.disconnect();
     session.stream.getTracks().forEach((track) => track.stop());
     this.session = null;
@@ -120,50 +123,61 @@ export class FskReceiver {
   }
 
   resetBits(): void {
-    if (!this.session) return;
-    this.session.slicer.reset();
-    this.handlers.onBits?.([]);
-  }
-
-  private tick(session: ActiveSession): void {
-    const { freq0, freq1 } = frequenciesFor(this.band);
-    const bins = new Float32Array(session.analyser.frequencyBinCount);
-    session.analyser.getFloatFrequencyData(bins);
-
-    const bin0 = binForFrequency(freq0, this.context.sampleRate, session.analyser.fftSize);
-    const bin1 = binForFrequency(freq1, this.context.sampleRate, session.analyser.fftSize);
-    const energy0 = bandEnergy(bins, bin0, PEAK_NEIGHBOR_BINS);
-    const energy1 = bandEnergy(bins, bin1, PEAK_NEIGHBOR_BINS);
-    const decision = decideBit(energy0, energy1);
-
-    this.handlers.onSpectrum?.({ freq0, freq1, energy0, energy1, decision });
-
-    const before = session.slicer.bits.length;
-    const lockedBefore = session.slicer.locked;
-    session.slicer.push(performance.now(), decision);
-    if (session.slicer.bits.length !== before) {
-      this.handlers.onBits?.([...session.slicer.bits]);
-      this.tryDecode(session);
-    } else if (lockedBefore && !session.slicer.locked) {
-      this.tryDecode(session);
-    }
-  }
-
-  private tryDecode(session: ActiveSession): void {
-    const result = decodeFramedBits(session.slicer.bits);
-    if (result.ok) {
-      this.handlers.onDecode?.(result);
-      this.handlers.onStatus?.("Decoded a frame");
-      session.slicer.reset();
+    if (!this.session) {
       this.handlers.onBits?.([]);
       return;
     }
-    if (result.reason.startsWith("CRC mismatch")) {
-      this.handlers.onDecode?.(result);
-      const syncIndex = findSyncIndex(session.slicer.bits);
-      if (syncIndex >= 0) {
-        session.slicer.bits = session.slicer.bits.slice(syncIndex + SYNC_BITS.length);
-        this.handlers.onBits?.([...session.slicer.bits]);
+    this.session.scanner.reset();
+    this.session.hops = [];
+    this.session.lastCrcBits = -1;
+    this.handlers.onBits?.([]);
+  }
+
+  private ingest(session: ActiveSession, chunk: Float32Array): void {
+    const { freq0, freq1 } = frequenciesFor(this.band);
+    const next = session.scanner.push(chunk, freq0, freq1, this.context.sampleRate);
+    if (next.length === 0) return;
+
+    session.hops.push(...next);
+    if (session.hops.length > 2000) {
+      session.hops.splice(0, session.hops.length - 2000);
+    }
+
+    const hop = next[next.length - 1];
+    const total = hop.p0 + hop.p1 + 1e-15;
+    this.handlers.onSpectrum?.({
+      freq0,
+      freq1,
+      energy0: hopPowerDb(hop.p0 / total),
+      energy1: hopPowerDb(hop.p1 / total),
+      decision: hop.p1 === hop.p0 ? null : hop.p1 > hop.p0 ? 1 : 0,
+      sampleRate: this.context.sampleRate,
+      hops: session.hops.length,
+    });
+
+    const recovered = recoverFrame(session.hops);
+    this.handlers.onBits?.([...recovered.bits]);
+
+    if (recovered.decoded.ok) {
+      this.handlers.onDecode?.(recovered.decoded);
+      this.handlers.onStatus?.(
+        `Decoded a frame (phase ${recovered.phase}, ${recovered.hopsPerBit} hops/bit)`,
+      );
+      session.scanner.reset();
+      session.hops = [];
+      session.lastCrcBits = -1;
+      return;
+    }
+
+    if (
+      recovered.decoded.reason.startsWith("CRC mismatch") &&
+      recovered.bits.length !== session.lastCrcBits
+    ) {
+      session.lastCrcBits = recovered.bits.length;
+      this.handlers.onDecode?.(recovered.decoded);
+      const syncIndex = findSyncIndex(recovered.bits);
+      if (syncIndex >= 0 && session.hops.length > 40) {
+        session.hops = session.hops.slice(Math.floor(session.hops.length / 3));
       }
     }
   }

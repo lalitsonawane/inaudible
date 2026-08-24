@@ -14,7 +14,9 @@ export const PEAK_NEIGHBOR_BINS = 2;
 export const SNR_RATIO = 1.6;
 export const MIN_TONE_DB = -75;
 export const TARGET_SAMPLE_RATE = 48_000;
-export const TRANSMIT_GAIN = 0.62;
+export const TRANSMIT_GAIN = 0.7;
+export const WINDOW_SAMPLES = 2048;
+export const HOP_SAMPLES = 512;
 
 export const PREAMBLE_BITS = [1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0] as const;
 export const SYNC_BITS = [0, 0, 0, 1, 1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1] as const;

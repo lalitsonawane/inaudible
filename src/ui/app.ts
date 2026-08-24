@@ -1,13 +1,13 @@
 import { BANDS, MAX_PAYLOAD_BYTES, TARGET_SAMPLE_RATE, type Band } from "../audio/constants";
-import { BitSlicer } from "../audio/clock";
-import { scanDecisions, synthesizeFsk } from "../audio/dsp";
+import { compareBits, recoverFrame } from "../audio/demod";
+import { scanHops, synthesizeFsk } from "../audio/dsp";
 import { FskReceiver, type SpectrumSample } from "../audio/receiver";
 import { transmitBits } from "../audio/sender";
 import {
-  decodeFramedBits,
   encodeMessage,
   formatBitString,
   transmissionDurationMs,
+  type Bit,
   type DecodeResult,
 } from "../audio/protocol";
 
@@ -42,10 +42,12 @@ export function mountApp(root: HTMLElement): void {
   const audioContext = createAudioContext();
   let band: Band = "ultrasonic";
   let sending = false;
+  let lastExpected: Bit[] = encodeMessage("hello fsk");
 
   const status = el("p", "status", "Ready. HTTPS or localhost is required for the microphone.");
   const message = el("p", "message", "No frame decoded yet");
   const bitsView = el("p", "bits", "Bits: —");
+  const compareView = el("p", "hint", "vs expected: —");
   const duration = el("p", "hint", "");
   const spectrumMeta = el("p", "spectrum-meta", "Spectrum idle");
   const bar0 = el("span");
@@ -69,14 +71,18 @@ export function mountApp(root: HTMLElement): void {
   const clearButton = el("button", "secondary", "Clear bits");
   const selfTestButton = el("button", "secondary", "Self-test decoder");
 
+  function showBits(bits: Bit[], label = "Bits"): void {
+    bitsView.textContent = bits.length ? `${label} (${bits.length}): ${formatBitString(bits)}` : "Bits: —";
+    const compared = compareBits(bits, lastExpected);
+    compareView.textContent = bits.length
+      ? `vs expected: ${compared.matches}/${compared.compared} match at offset ${compared.offset}`
+      : "vs expected: —";
+  }
+
   const receiver = new FskReceiver(audioContext, {
     onStatus: (text) => setStatus(text),
     onError: (error) => setStatus(error.message, true),
-    onBits: (bits) => {
-      bitsView.textContent = bits.length
-        ? `Bits (${bits.length}): ${formatBitString(bits)}`
-        : "Bits: —";
-    },
+    onBits: (bits) => showBits(bits, "Live"),
     onDecode: (result: DecodeResult) => {
       if (result.ok) {
         message.textContent = result.text;
@@ -89,7 +95,7 @@ export function mountApp(root: HTMLElement): void {
       bar0.style.width = energyWidth(sample.energy0);
       bar1.style.width = energyWidth(sample.energy1);
       const decided = sample.decision === null ? "silence" : `bit ${sample.decision}`;
-      spectrumMeta.textContent = `${sample.freq0} Hz ${sample.energy0.toFixed(1)} dB · ${sample.freq1} Hz ${sample.energy1.toFixed(1)} dB · ${decided}`;
+      spectrumMeta.textContent = `${sample.freq0} Hz ${sample.energy0.toFixed(1)} dB · ${sample.freq1} Hz ${sample.energy1.toFixed(1)} dB · ${decided} · ${sample.sampleRate} Hz · ${sample.hops} hops`;
     },
   });
 
@@ -100,10 +106,29 @@ export function mountApp(root: HTMLElement): void {
 
   function refreshDuration(): void {
     try {
-      const bits = encodeMessage(textarea.value);
-      duration.textContent = `${bits.length} bits · ${transmissionDurationMs(bits.length)} ms`;
+      lastExpected = encodeMessage(textarea.value);
+      duration.textContent = `${lastExpected.length} bits · ${transmissionDurationMs(lastExpected.length)} ms`;
     } catch (error) {
       duration.textContent = error instanceof Error ? error.message : "Invalid payload";
+    }
+  }
+
+  function runDecoderSelfTest(): void {
+    const bits = encodeMessage(textarea.value);
+    lastExpected = bits;
+    const { freq0, freq1 } = BANDS[band];
+    const rate = audioContext.sampleRate || TARGET_SAMPLE_RATE;
+    const audio = synthesizeFsk(bits, freq0, freq1, rate);
+    const recovered = recoverFrame(scanHops(audio, freq0, freq1, rate));
+    showBits(recovered.bits, "Self-test");
+    if (recovered.decoded.ok) {
+      message.textContent = recovered.decoded.text;
+      setStatus(
+        `Self-test decoded ${recovered.decoded.bytes.length} bytes on ${BANDS[band].label} (${recovered.hopsPerBit} hops/bit)`,
+      );
+    } else {
+      message.textContent = "Self-test failed";
+      setStatus(recovered.decoded.reason, true);
     }
   }
 
@@ -120,9 +145,10 @@ export function mountApp(root: HTMLElement): void {
     sending = true;
     sendButton.disabled = true;
     try {
-      const bits = encodeMessage(textarea.value);
-      setStatus(`Transmitting ${bits.length} bits on ${BANDS[band].label}`);
-      await transmitBits(bits, band, audioContext);
+      lastExpected = encodeMessage(textarea.value);
+      receiver.resetBits();
+      setStatus(`Transmitting ${lastExpected.length} bits on ${BANDS[band].label}`);
+      await transmitBits(lastExpected, band, audioContext);
       setStatus("Transmission complete");
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Transmit failed", true);
@@ -149,31 +175,13 @@ export function mountApp(root: HTMLElement): void {
   clearButton.addEventListener("click", () => {
     receiver.resetBits();
     message.textContent = "No frame decoded yet";
+    showBits([]);
     setStatus("Bit buffer cleared");
   });
 
   selfTestButton.addEventListener("click", () => {
     try {
-      const bits = encodeMessage(textarea.value);
-      const { freq0, freq1 } = BANDS[band];
-      const audio = synthesizeFsk(bits, freq0, freq1, audioContext.sampleRate || TARGET_SAMPLE_RATE);
-      const slicer = new BitSlicer();
-      const rate = audioContext.sampleRate || TARGET_SAMPLE_RATE;
-      for (const sample of scanDecisions(audio, freq0, freq1, rate)) {
-        slicer.push(sample.now, sample.decision);
-      }
-      slicer.push((audio.length / rate) * 1000 + 400, null);
-      const decoded = decodeFramedBits(slicer.bits);
-      bitsView.textContent = slicer.bits.length
-        ? `Bits (${slicer.bits.length}): ${formatBitString(slicer.bits)}`
-        : "Bits: —";
-      if (decoded.ok) {
-        message.textContent = decoded.text;
-        setStatus(`Self-test decoded ${decoded.bytes.length} bytes on ${BANDS[band].label}`);
-      } else {
-        message.textContent = "Self-test failed";
-        setStatus(decoded.reason, true);
-      }
+      runDecoderSelfTest();
     } catch (error) {
       setStatus(error instanceof Error ? error.message : "Self-test failed", true);
     }
@@ -183,7 +191,11 @@ export function mountApp(root: HTMLElement): void {
   hero.append(
     el("p", "eyebrow", "Web Audio proof of concept"),
     el("h1", undefined, "Inaudible FSK link"),
-    el("p", "lede", "Send and receive short messages with OscillatorNode FSK and AnalyserNode FFT. The receiver locks to 0/1 transitions and samples mid-symbol. Use ultrasonic tones on two devices, or the audible band for a single-device demo."),
+    el(
+      "p",
+      "lede",
+      "Sender and receiver now share the same Goertzel hop decoder. Start listening first, then transmit. Self-test uses the identical demodulator on clean PCM so you can compare bit strings.",
+    ),
   );
 
   const sendPanel = el("section", "panel");
@@ -209,11 +221,12 @@ export function mountApp(root: HTMLElement): void {
   receiveRow.append(listenButton, clearButton, selfTestButton);
   receivePanel.append(
     el("h2", undefined, "Receiver"),
-    el("p", "hint", "Allow microphone access on the receiver first, then transmit from the other device on the same band. Turn media volume up; keep phones a few centimeters apart."),
+    el("p", "hint", "Live decode reads microphone PCM and searches every symbol phase. If vs expected stays low, the mic is not hearing both carriers — try the audible band or raise volume."),
     receiveRow,
     spectrum,
     spectrumMeta,
     bitsView,
+    compareView,
     message,
     status,
   );

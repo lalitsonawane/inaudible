@@ -114,8 +114,8 @@ export function findSyncIndex(bits: readonly number[], maxDistance = 1): number 
   return bestDistance <= maxDistance ? bestIndex : -1;
 }
 
-export function decodeFramedBits(bits: readonly number[]): DecodeResult {
-  const syncIndex = findSyncIndex(bits);
+export function decodeFramedBits(bits: readonly number[], maxDistance = 1): DecodeResult {
+  const syncIndex = findSyncIndex(bits, maxDistance);
   if (syncIndex < 0) return { ok: false, reason: "Sync word not found" };
   const afterSync = bits.slice(syncIndex + SYNC_BITS.length);
   if (afterSync.length < 16) return { ok: false, reason: "Frame truncated before length/CRC" };

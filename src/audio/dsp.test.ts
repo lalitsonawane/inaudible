@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { BitSlicer } from "./clock";
 import { ULTRASONIC_FREQ_0, ULTRASONIC_FREQ_1 } from "./constants";
-import { classifyWindow, scanDecisions, synthesizeFsk } from "./dsp";
-import { decodeFramedBits, encodeMessage } from "./protocol";
+import { recoverFrame } from "./demod";
+import { classifyWindow, scanHops, synthesizeFsk } from "./dsp";
+import { encodeMessage } from "./protocol";
 
 describe("PCM FSK loopback", () => {
   it("classifies a pure ultrasonic mark and space", () => {
@@ -12,18 +12,13 @@ describe("PCM FSK loopback", () => {
     expect(classifyWindow(mark, ULTRASONIC_FREQ_0, ULTRASONIC_FREQ_1)).toBe(1);
   });
 
-  it("decodes a synthesized inaudible frame", () => {
-    const framed = encodeMessage("hello fsk");
-    const audio = synthesizeFsk(framed, ULTRASONIC_FREQ_0, ULTRASONIC_FREQ_1);
-    const slicer = new BitSlicer();
-    for (const sample of scanDecisions(audio, ULTRASONIC_FREQ_0, ULTRASONIC_FREQ_1)) {
-      slicer.push(sample.now, sample.decision);
-    }
-    slicer.push((audio.length / 48_000) * 1000 + 400, null);
-    const decoded = decodeFramedBits(slicer.bits);
-    expect(decoded.ok).toBe(true);
-    if (decoded.ok) {
-      expect(decoded.text).toBe("hello fsk");
+  it("decodes a synthesized inaudible frame with the shared demodulator", () => {
+    const bits = encodeMessage("hello fsk");
+    const audio = synthesizeFsk(bits, ULTRASONIC_FREQ_0, ULTRASONIC_FREQ_1);
+    const recovered = recoverFrame(scanHops(audio, ULTRASONIC_FREQ_0, ULTRASONIC_FREQ_1));
+    expect(recovered.decoded.ok).toBe(true);
+    if (recovered.decoded.ok) {
+      expect(recovered.decoded.text).toBe("hello fsk");
     }
   });
 });
