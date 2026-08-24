@@ -8,6 +8,12 @@ import {
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
 
+export type Bit = 0 | 1;
+
+export type DecodeResult =
+  | { ok: true; text: string; bytes: Uint8Array; crc: number }
+  | { ok: false; reason: string };
+
 export function crc8(bytes: Uint8Array): number {
   let crc = 0;
   for (const byte of bytes) {
@@ -19,27 +25,27 @@ export function crc8(bytes: Uint8Array): number {
   return crc;
 }
 
-export function byteToBits(value: number): number[] {
-  const bits = [];
+export function byteToBits(value: number): Bit[] {
+  const bits: Bit[] = [];
   for (let i = 7; i >= 0; i -= 1) {
-    bits.push((value >> i) & 1);
+    bits.push((((value >> i) & 1) === 1 ? 1 : 0) as Bit);
   }
   return bits;
 }
 
-export function bitsToByte(bits) {
+export function bitsToByte(bits: readonly number[]): number {
   return bits.reduce((acc, bit) => (acc << 1) | (bit & 1), 0);
 }
 
-export function bytesToBits(bytes) {
-  const bits = [];
+export function bytesToBits(bytes: Uint8Array): Bit[] {
+  const bits: Bit[] = [];
   for (const byte of bytes) {
     bits.push(...byteToBits(byte));
   }
   return bits;
 }
 
-export function bitsToBytes(bits) {
+export function bitsToBytes(bits: readonly number[]): Uint8Array {
   const bytes = new Uint8Array(Math.floor(bits.length / 8));
   for (let i = 0; i < bytes.length; i += 1) {
     bytes[i] = bitsToByte(bits.slice(i * 8, i * 8 + 8));
@@ -47,7 +53,7 @@ export function bitsToBytes(bits) {
   return bytes;
 }
 
-export function encodeText(text) {
+export function encodeText(text: string): Uint8Array {
   const encoded = textEncoder.encode(text);
   if (encoded.length > MAX_PAYLOAD_BYTES) {
     throw new Error("Payload exceeds " + MAX_PAYLOAD_BYTES + " bytes");
@@ -55,11 +61,11 @@ export function encodeText(text) {
   return encoded;
 }
 
-export function decodeText(bytes) {
+export function decodeText(bytes: Uint8Array): string {
   return textDecoder.decode(bytes);
 }
 
-export function framePayload(payload) {
+export function framePayload(payload: Uint8Array): Bit[] {
   if (payload.length > MAX_PAYLOAD_BYTES) {
     throw new Error("Payload exceeds " + MAX_PAYLOAD_BYTES + " bytes");
   }
@@ -67,19 +73,24 @@ export function framePayload(payload) {
   headerAndBody[0] = payload.length;
   headerAndBody.set(payload, 1);
   const checksum = crc8(headerAndBody);
-  return [...PREAMBLE_BITS, ...SYNC_BITS, ...bytesToBits(headerAndBody), ...byteToBits(checksum)];
+  return [
+    ...PREAMBLE_BITS,
+    ...SYNC_BITS,
+    ...bytesToBits(headerAndBody),
+    ...byteToBits(checksum),
+  ];
 }
 
-export function encodeMessage(text) {
+export function encodeMessage(text: string): Bit[] {
   return framePayload(encodeText(text));
 }
 
-export function bitsEqual(a, b) {
+export function bitsEqual(a: readonly number[], b: readonly number[]): boolean {
   if (a.length !== b.length) return false;
   return a.every((bit, index) => bit === b[index]);
 }
 
-export function findSyncIndex(bits) {
+export function findSyncIndex(bits: readonly number[]): number {
   if (bits.length < SYNC_BITS.length) return -1;
   for (let i = 0; i <= bits.length - SYNC_BITS.length; i += 1) {
     if (bitsEqual(bits.slice(i, i + SYNC_BITS.length), SYNC_BITS)) return i;
@@ -87,7 +98,7 @@ export function findSyncIndex(bits) {
   return -1;
 }
 
-export function decodeFramedBits(bits) {
+export function decodeFramedBits(bits: readonly number[]): DecodeResult {
   const syncIndex = findSyncIndex(bits);
   if (syncIndex < 0) return { ok: false, reason: "Sync word not found" };
   const afterSync = bits.slice(syncIndex + SYNC_BITS.length);
@@ -104,17 +115,25 @@ export function decodeFramedBits(bits) {
   headerAndBody.set(payload, 1);
   const expected = crc8(headerAndBody);
   const received = bitsToByte(crcBits);
-  if (expected !== received) return { ok: false, reason: "CRC mismatch (got " + received + ", expected " + expected + ")" };
+  if (expected !== received) {
+    return {
+      ok: false,
+      reason: "CRC mismatch (got " + received + ", expected " + expected + ")",
+    };
+  }
   return { ok: true, text: decodeText(payload), bytes: payload, crc: received };
 }
 
-export function transmissionDurationMs(bitCount) {
+export function transmissionDurationMs(bitCount: number): number {
   return bitCount * BIT_DURATION_MS;
 }
 
-export function formatBitString(bits, group = 8) {
-  return bits.map((bit, index) => {
-    const value = String(bit);
-    return (index + 1) % group === 0 ? value + " " : value;
-  }).join("").trim();
+export function formatBitString(bits: readonly number[], group = 8): string {
+  return bits
+    .map((bit, index) => {
+      const value = String(bit);
+      return (index + 1) % group === 0 ? value + " " : value;
+    })
+    .join("")
+    .trim();
 }
