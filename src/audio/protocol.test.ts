@@ -24,6 +24,13 @@ describe("FSK frame codec", () => {
     expect(findSyncIndex(bits)).toBe(16);
   });
 
+  it("accepts a one-bit error in the sync word", () => {
+    const bits = encodeMessage("ok");
+    bits[20] = bits[20] === 1 ? 0 : 1;
+    expect(findSyncIndex(bits, 1)).toBe(16);
+    expect(findSyncIndex(bits, 0)).toBe(-1);
+  });
+
   it("rejects a flipped payload bit", () => {
     const bits = encodeMessage("crc");
     bits[40] = bits[40] === 1 ? 0 : 1;
@@ -40,7 +47,7 @@ describe("FSK frame codec", () => {
 
   it("formats bits and estimates duration", () => {
     expect(formatBitString([1, 0, 1, 1, 0, 0, 0, 1, 1])).toBe("10110001 1");
-    expect(transmissionDurationMs(10)).toBe(700);
+    expect(transmissionDurationMs(10)).toBe(1000);
     expect(crc8(new Uint8Array([1, 2, 3]))).toBeGreaterThanOrEqual(0);
   });
 });
