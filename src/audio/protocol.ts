@@ -90,12 +90,28 @@ export function bitsEqual(a: readonly number[], b: readonly number[]): boolean {
   return a.every((bit, index) => bit === b[index]);
 }
 
-export function findSyncIndex(bits: readonly number[]): number {
-  if (bits.length < SYNC_BITS.length) return -1;
-  for (let i = 0; i <= bits.length - SYNC_BITS.length; i += 1) {
-    if (bitsEqual(bits.slice(i, i + SYNC_BITS.length), SYNC_BITS)) return i;
+export function bitDistance(a: readonly number[], b: readonly number[]): number {
+  if (a.length !== b.length) return Number.POSITIVE_INFINITY;
+  let distance = 0;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) distance += 1;
   }
-  return -1;
+  return distance;
+}
+
+export function findSyncIndex(bits: readonly number[], maxDistance = 1): number {
+  if (bits.length < SYNC_BITS.length) return -1;
+  let bestIndex = -1;
+  let bestDistance = maxDistance + 1;
+  for (let i = 0; i <= bits.length - SYNC_BITS.length; i += 1) {
+    const distance = bitDistance(bits.slice(i, i + SYNC_BITS.length), SYNC_BITS);
+    if (distance === 0) return i;
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestIndex = i;
+    }
+  }
+  return bestDistance <= maxDistance ? bestIndex : -1;
 }
 
 export function decodeFramedBits(bits: readonly number[]): DecodeResult {

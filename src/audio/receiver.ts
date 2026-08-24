@@ -1,14 +1,15 @@
 import {
   ANALYSER_SMOOTHING,
-  BIT_DURATION_MS,
   FFT_SIZE,
-  MIN_TONE_DB,
   PEAK_NEIGHBOR_BINS,
-  SNR_RATIO,
+  SYNC_BITS,
+  TARGET_SAMPLE_RATE,
   frequenciesFor,
   type Band,
 } from "./constants";
-import { decodeFramedBits, type Bit, type DecodeResult } from "./protocol";
+import { bandEnergy, binForFrequency, decideBit } from "./classify";
+import { BitSlicer } from "./clock";
+import { decodeFramedBits, findSyncIndex, type Bit, type DecodeResult } from "./protocol";
 
 export interface SpectrumSample {
   freq0: number;
@@ -30,37 +31,18 @@ interface ActiveSession {
   stream: MediaStream;
   source: MediaStreamAudioSourceNode;
   analyser: AnalyserNode;
-  timer: number;
-  bits: Bit[];
-  lastDecision: Bit | null;
-  lastDecisionAt: number;
+  raf: number;
+  slicer: BitSlicer;
 }
 
-function binForFrequency(frequency: number, sampleRate: number, fftSize: number): number {
-  return Math.round((frequency * fftSize) / sampleRate);
-}
-
-function bandEnergy(db: Float32Array, centerBin: number, neighbors: number): number {
-  let sum = 0;
-  let count = 0;
-  for (let i = centerBin - neighbors; i <= centerBin + neighbors; i += 1) {
-    if (i >= 0 && i < db.length) {
-      sum += db[i];
-      count += 1;
-    }
-  }
-  return count === 0 ? MIN_TONE_DB : sum / count;
-}
-
-function decideBit(energy0: number, energy1: number): Bit | null {
-  const louder = Math.max(energy0, energy1);
-  if (louder < MIN_TONE_DB) return null;
-  const p0 = 10 ** (energy0 / 10);
-  const p1 = 10 ** (energy1 / 10);
-  const peak = Math.max(p0, p1);
-  const other = Math.min(p0, p1);
-  if (other <= 0 || peak / other < SNR_RATIO) return null;
-  return p1 > p0 ? 1 : 0;
+function microphoneConstraints(): MediaTrackConstraints {
+  return {
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
+    channelCount: 1,
+    sampleRate: TARGET_SAMPLE_RATE,
+  };
 }
 
 export class FskReceiver {
@@ -75,10 +57,8 @@ export class FskReceiver {
 
   setBand(band: Band): void {
     this.band = band;
-    if (this.session) {
-      this.session.bits = [];
-      this.session.lastDecision = null;
-    }
+    this.session?.slicer.reset();
+    this.handlers.onBits?.([]);
   }
 
   async start(): Promise<void> {
@@ -90,13 +70,18 @@ export class FskReceiver {
       await this.context.resume();
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: false,
-        noiseSuppression: false,
-        autoGainControl: false,
-      },
-    });
+    let stream: MediaStream;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: microphoneConstraints() });
+    } catch {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+      });
+    }
 
     const source = this.context.createMediaStreamSource(stream);
     const analyser = this.context.createAnalyser();
@@ -110,20 +95,24 @@ export class FskReceiver {
       stream,
       source,
       analyser,
-      timer: 0,
-      bits: [],
-      lastDecision: null,
-      lastDecisionAt: 0,
+      raf: 0,
+      slicer: new BitSlicer(),
     };
     this.session = session;
     this.handlers.onStatus?.("Listening for FSK tones");
-    session.timer = window.setInterval(() => this.tick(session), 16);
+
+    const loop = (): void => {
+      if (this.session !== session) return;
+      this.tick(session);
+      session.raf = requestAnimationFrame(loop);
+    };
+    session.raf = requestAnimationFrame(loop);
   }
 
   stop(): void {
     const session = this.session;
     if (!session) return;
-    window.clearInterval(session.timer);
+    cancelAnimationFrame(session.raf);
     session.source.disconnect();
     session.stream.getTracks().forEach((track) => track.stop());
     this.session = null;
@@ -131,11 +120,9 @@ export class FskReceiver {
   }
 
   resetBits(): void {
-    if (this.session) {
-      this.session.bits = [];
-      this.session.lastDecision = null;
-      this.handlers.onBits?.([]);
-    }
+    if (!this.session) return;
+    this.session.slicer.reset();
+    this.handlers.onBits?.([]);
   }
 
   private tick(session: ActiveSession): void {
@@ -151,39 +138,33 @@ export class FskReceiver {
 
     this.handlers.onSpectrum?.({ freq0, freq1, energy0, energy1, decision });
 
-    const now = performance.now();
-    if (decision === null) {
-      if (session.lastDecision !== null && now - session.lastDecisionAt > BIT_DURATION_MS * 3) {
-        this.tryDecode(session);
-        session.lastDecision = null;
-      }
-      return;
-    }
-
-    if (
-      session.lastDecision === null ||
-      now - session.lastDecisionAt >= BIT_DURATION_MS * 0.85
-    ) {
-      session.bits.push(decision);
-      session.lastDecision = decision;
-      session.lastDecisionAt = now;
-      this.handlers.onBits?.([...session.bits]);
+    const before = session.slicer.bits.length;
+    const lockedBefore = session.slicer.locked;
+    session.slicer.push(performance.now(), decision);
+    if (session.slicer.bits.length !== before) {
+      this.handlers.onBits?.([...session.slicer.bits]);
+      this.tryDecode(session);
+    } else if (lockedBefore && !session.slicer.locked) {
       this.tryDecode(session);
     }
   }
 
   private tryDecode(session: ActiveSession): void {
-    const result = decodeFramedBits(session.bits);
+    const result = decodeFramedBits(session.slicer.bits);
     if (result.ok) {
       this.handlers.onDecode?.(result);
       this.handlers.onStatus?.("Decoded a frame");
-      session.bits = [];
-      session.lastDecision = null;
+      session.slicer.reset();
       this.handlers.onBits?.([]);
       return;
     }
     if (result.reason.startsWith("CRC mismatch")) {
       this.handlers.onDecode?.(result);
+      const syncIndex = findSyncIndex(session.slicer.bits);
+      if (syncIndex >= 0) {
+        session.slicer.bits = session.slicer.bits.slice(syncIndex + SYNC_BITS.length);
+        this.handlers.onBits?.([...session.slicer.bits]);
+      }
     }
   }
 }

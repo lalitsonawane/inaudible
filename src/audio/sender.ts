@@ -1,7 +1,7 @@
-import { BIT_DURATION_MS, frequenciesFor, type Band } from "./constants";
+import { BIT_DURATION_MS, TRANSMIT_GAIN, frequenciesFor, type Band } from "./constants";
 import type { Bit } from "./protocol";
 
-const RAMP_MS = 4;
+const RAMP_MS = 6;
 
 export async function transmitBits(
   bits: readonly Bit[],
@@ -23,10 +23,10 @@ export async function transmitBits(
   oscillator.connect(gain);
   gain.connect(context.destination);
 
-  const startAt = context.currentTime + 0.04;
+  const startAt = context.currentTime + 0.05;
   oscillator.frequency.setValueAtTime(bits[0] === 1 ? freq1 : freq0, startAt);
   gain.gain.setValueAtTime(0, startAt);
-  gain.gain.linearRampToValueAtTime(0.22, startAt + ramp);
+  gain.gain.linearRampToValueAtTime(TRANSMIT_GAIN, startAt + ramp);
 
   bits.forEach((bit, index) => {
     const t = startAt + index * bitDuration;
@@ -34,7 +34,7 @@ export async function transmitBits(
   });
 
   const endAt = startAt + bits.length * bitDuration;
-  gain.gain.setValueAtTime(0.22, endAt - ramp);
+  gain.gain.setValueAtTime(TRANSMIT_GAIN, endAt - ramp);
   gain.gain.linearRampToValueAtTime(0, endAt);
 
   oscillator.start(startAt);

@@ -1,7 +1,10 @@
-import { BANDS, MAX_PAYLOAD_BYTES, type Band } from "../audio/constants";
+import { BANDS, MAX_PAYLOAD_BYTES, TARGET_SAMPLE_RATE, type Band } from "../audio/constants";
+import { BitSlicer } from "../audio/clock";
+import { scanDecisions, synthesizeFsk } from "../audio/dsp";
 import { FskReceiver, type SpectrumSample } from "../audio/receiver";
 import { transmitBits } from "../audio/sender";
 import {
+  decodeFramedBits,
   encodeMessage,
   formatBitString,
   transmissionDurationMs,
@@ -24,8 +27,19 @@ function energyWidth(db: number): string {
   return `${((clamped + 100) / 100) * 100}%`;
 }
 
+function createAudioContext(): AudioContext {
+  const Ctor =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+  try {
+    return new Ctor({ sampleRate: TARGET_SAMPLE_RATE, latencyHint: "interactive" });
+  } catch {
+    return new Ctor();
+  }
+}
+
 export function mountApp(root: HTMLElement): void {
-  const audioContext = new AudioContext();
+  const audioContext = createAudioContext();
   let band: Band = "ultrasonic";
   let sending = false;
 
@@ -53,6 +67,7 @@ export function mountApp(root: HTMLElement): void {
   const sendButton = el("button", undefined, "Transmit");
   const listenButton = el("button", "secondary", "Start listening");
   const clearButton = el("button", "secondary", "Clear bits");
+  const selfTestButton = el("button", "secondary", "Self-test decoder");
 
   const receiver = new FskReceiver(audioContext, {
     onStatus: (text) => setStatus(text),
@@ -137,11 +152,38 @@ export function mountApp(root: HTMLElement): void {
     setStatus("Bit buffer cleared");
   });
 
+  selfTestButton.addEventListener("click", () => {
+    try {
+      const bits = encodeMessage(textarea.value);
+      const { freq0, freq1 } = BANDS[band];
+      const audio = synthesizeFsk(bits, freq0, freq1, audioContext.sampleRate || TARGET_SAMPLE_RATE);
+      const slicer = new BitSlicer();
+      const rate = audioContext.sampleRate || TARGET_SAMPLE_RATE;
+      for (const sample of scanDecisions(audio, freq0, freq1, rate)) {
+        slicer.push(sample.now, sample.decision);
+      }
+      slicer.push((audio.length / rate) * 1000 + 400, null);
+      const decoded = decodeFramedBits(slicer.bits);
+      bitsView.textContent = slicer.bits.length
+        ? `Bits (${slicer.bits.length}): ${formatBitString(slicer.bits)}`
+        : "Bits: —";
+      if (decoded.ok) {
+        message.textContent = decoded.text;
+        setStatus(`Self-test decoded ${decoded.bytes.length} bytes on ${BANDS[band].label}`);
+      } else {
+        message.textContent = "Self-test failed";
+        setStatus(decoded.reason, true);
+      }
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Self-test failed", true);
+    }
+  });
+
   const hero = el("header", "hero");
   hero.append(
     el("p", "eyebrow", "Web Audio proof of concept"),
     el("h1", undefined, "Inaudible FSK link"),
-    el("p", "lede", "Send and receive short messages with OscillatorNode FSK and AnalyserNode FFT. Use ultrasonic tones on two devices, or the audible band for a single-device demo."),
+    el("p", "lede", "Send and receive short messages with OscillatorNode FSK and AnalyserNode FFT. The receiver locks to 0/1 transitions and samples mid-symbol. Use ultrasonic tones on two devices, or the audible band for a single-device demo."),
   );
 
   const sendPanel = el("section", "panel");
@@ -164,10 +206,10 @@ export function mountApp(root: HTMLElement): void {
   wrap1.append(bar1);
   spectrum.append(wrap0, wrap1);
   const receiveRow = el("div", "row");
-  receiveRow.append(listenButton, clearButton);
+  receiveRow.append(listenButton, clearButton, selfTestButton);
   receivePanel.append(
     el("h2", undefined, "Receiver"),
-    el("p", "hint", "Allow microphone access, then listen on the same band as the sender."),
+    el("p", "hint", "Allow microphone access on the receiver first, then transmit from the other device on the same band. Turn media volume up; keep phones a few centimeters apart."),
     receiveRow,
     spectrum,
     spectrumMeta,
