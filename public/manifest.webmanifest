@@ -1,0 +1,16 @@
+{
+  "name": "Ultrasonic FSK Link",
+  "short_name": "FSK Link",
+  "description": "Inaudible FSK data transmission using the Web Audio API.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#070b12",
+  "theme_color": "#070b12",
+  "icons": [
+    {
+      "src": "/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
+  ]
+}
