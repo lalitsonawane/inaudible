@@ -234,4 +234,5 @@ export function mountApp(root: HTMLElement): void {
   grid.append(sendPanel, receivePanel);
   root.append(hero, grid);
   refreshDuration();
+  showBits([]);
 }
